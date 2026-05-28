@@ -3,7 +3,8 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>MHP IncidentControl SharePoint v6</title>
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0" />
+<title>MHP IncidentControl v42 NO STATUS ROLLBACK</title>
 <style>
 :root{--navy:#071225;--blue:#0b7fe8;--bg:#f5f7fb;--card:#fff;--line:#dfe3ea;--text:#111827;--muted:#6b7280;--orange:#ff6a00;--green:#1f9d55;--red:#d93025}
 *{box-sizing:border-box}
@@ -297,91 +298,100 @@ let isAutoRefreshing = false;
 
 
 const LOCAL_INCIDENT_CACHE_KEY = "MHP_INCIDENTCONTROL_LOCAL_INCIDENTS_V1";
+let tempJustCreatedIncidents = [];
 
 function loadLocalIncidentCache() {
-  try {
-    const raw = localStorage.getItem(LOCAL_INCIDENT_CACHE_KEY);
-    const arr = JSON.parse(raw || "[]");
-    return Array.isArray(arr) ? arr : [];
-  } catch(e) {
-    return [];
-  }
+  return [];
 }
 
 function saveLocalIncidentCache(arr) {
-  try {
-    localStorage.setItem(LOCAL_INCIDENT_CACHE_KEY, JSON.stringify((arr || []).slice(0, 300)));
-  } catch(e) {}
+  // v39: disabled. SharePoint/List is the only source of truth.
 }
 
 function rememberIncidentLocally(item) {
-  const cache = loadLocalIncidentCache();
-  const prepared = {...item, _localCreatedAt: item._localCreatedAt || Date.now()};
-  const idx = cache.findIndex(x => x && x.id === prepared.id);
-  if (idx >= 0) cache[idx] = {...cache[idx], ...prepared};
-  else cache.unshift(prepared);
-  saveLocalIncidentCache(cache);
+  if (!item || !item.id) return;
+  tempJustCreatedIncidents = [item, ...tempJustCreatedIncidents.filter(x => x && x.id !== item.id)].slice(0, 20);
+}
+
+function incidentCompletenessScoreV39(i) {
+  return [
+    i?.employee,
+    i?.product,
+    i?.reason,
+    i?.department,
+    i?.date,
+    Number(i?.weight || 0) > 0,
+    Number(i?.loss || 0) > 0,
+    Number(i?.score || 0) > 0,
+    Number(i?.percent || 0) > 0,
+    i?.photo
+  ].filter(Boolean).length;
+}
+
+
+const RESOLVED_STATUSES_V42 = ["Затверджено","Підтверджено","Відхилено","Розглянуто"];
+let managerDecisionOverridesV42 = {};
+
+function isResolvedStatusV42(s) {
+  return RESOLVED_STATUSES_V42.includes(String(s || "").trim());
+}
+
+function mergeOneIncidentV42(oldItem, newItem) {
+  if (!oldItem) return newItem;
+  if (!newItem) return oldItem;
+
+  const oldResolved = isResolvedStatusV42(oldItem.status);
+  const newResolved = isResolvedStatusV42(newItem.status);
+
+  // If one copy is already resolved, it must win over "На розгляді".
+  const winner = newResolved && !oldResolved ? newItem :
+                 oldResolved && !newResolved ? oldItem :
+                 incidentCompletenessScoreV39(newItem) >= incidentCompletenessScoreV39(oldItem) ? newItem : oldItem;
+
+  const other = winner === newItem ? oldItem : newItem;
+
+  return {
+    ...other,
+    ...winner,
+    // Never lose resolved decision/comment/final percent.
+    status: isResolvedStatusV42(winner.status) ? winner.status : (isResolvedStatusV42(other.status) ? other.status : winner.status),
+    finalPercent: Number(winner.finalPercent || 0) || Number(other.finalPercent || 0) || 0,
+    managerComment: winner.managerComment || other.managerComment || "",
+    approved: isResolvedStatusV42(winner.status) || isResolvedStatusV42(other.status) || Boolean(winner.approved || other.approved)
+  };
+}
+
+function applyManagerOverrideV42(item) {
+  const ov = managerDecisionOverridesV42[item.id];
+  if (!ov) return item;
+  if (Date.now() - ov.ts > 10 * 60 * 1000) {
+    delete managerDecisionOverridesV42[item.id];
+    return item;
+  }
+  return {
+    ...item,
+    status: ov.status,
+    finalPercent: ov.finalPercent,
+    managerComment: ov.managerComment,
+    approved: true
+  };
 }
 
 function mergeIncidentsWithLocalCache(serverIncidents, options = {}) {
-  const cache = loadLocalIncidentCache();
-  const server = Array.isArray(serverIncidents) ? serverIncidents : [];
-  const serverIds = new Set(server.filter(i => i && i.id).map(i => i.id));
-  const now = Date.now();
-  const graceMs = 2 * 60 * 1000; // 2 хвилини після створення, поки SharePoint може підтягнути запис
-
   const byId = new Map();
 
-  // 1. Основою завжди є SharePoint
-  server.forEach(i => {
-    if (i && i.id) byId.set(i.id, i);
+  (Array.isArray(serverIncidents) ? serverIncidents : []).forEach(i => {
+    if (!i || !i.id) return;
+    const merged = mergeOneIncidentV42(byId.get(i.id), i);
+    byId.set(i.id, applyManagerOverrideV42(merged));
   });
 
-  // 2. Кеш тільки доповнює ті записи, які існують у SharePoint
-  cache.forEach(local => {
-    if (!local || !local.id) return;
-
-    const isFreshLocal = local._localCreatedAt && (now - Number(local._localCreatedAt) < graceMs);
-    const existsOnServer = serverIds.has(local.id);
-
-    // Якщо запис видалили в SharePoint — він зникає із сайту.
-    // Виняток: щойно створений запис можна показувати до 2 хв, поки Flow GET підтягне його.
-    if (!existsOnServer && !isFreshLocal) return;
-
-    const current = byId.get(local.id);
-
-    if (!current) {
-      byId.set(local.id, local);
-      return;
-    }
-
-    byId.set(local.id, {
-      ...current,
-      employee: current.employee || local.employee,
-      product: current.product || local.product,
-      reason: current.reason || local.reason,
-      department: current.department || local.department,
-      description: current.description || local.description,
-      date: current.date || local.date,
-      time: current.time || local.time,
-      weight: Number(current.weight || 0) ? current.weight : local.weight,
-      loss: Number(current.loss || 0) ? current.loss : local.loss,
-      score: Number(current.score || 0) ? current.score : local.score,
-      percent: Number(current.percent || 0) ? current.percent : local.percent,
-      finalPercent: Number(current.finalPercent || 0) ? current.finalPercent : local.finalPercent,
-      photo: current.photo || local.photo,
-      status: current.status || local.status,
-      approved: current.approved || local.approved
-    });
-  });
-
-  // 3. Очищаємо кеш від "привидів": залишаємо тільки те, що є в SharePoint або щойно створене
-  const cleanedCache = cache.filter(local => {
-    if (!local || !local.id) return false;
-    const isFreshLocal = local._localCreatedAt && (now - Number(local._localCreatedAt) < graceMs);
-    return serverIds.has(local.id) || isFreshLocal;
-  });
-  saveLocalIncidentCache(cleanedCache);
+  // Temporary only: show newly created item until GET-flow returns it from SharePoint.
+  const now = Date.now();
+  tempJustCreatedIncidents = tempJustCreatedIncidents.filter(i =>
+    i && i.id && !byId.has(i.id) && i._localCreatedAt && (now - Number(i._localCreatedAt) < 120000)
+  );
+  tempJustCreatedIncidents.forEach(i => byId.set(i.id, applyManagerOverrideV42(i)));
 
   return Array.from(byId.values()).sort((a,b) => String(b.id).localeCompare(String(a.id)));
 }
@@ -730,6 +740,196 @@ function smartNumber(obj, exactNames, keyParts, fallback = 0) {
   return fallback;
 }
 
+
+/* v39 SharePoint Incidents robust reader */
+function v39Text(v) {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "object") {
+    if (Array.isArray(v)) return v.map(v39Text).filter(Boolean).join(", ");
+    return String(v.Value ?? v.value ?? v.Title ?? v.title ?? v.DisplayName ?? v.displayName ?? v.Email ?? v.email ?? "");
+  }
+  return String(v);
+}
+function v39Num(v) {
+  let s = v39Text(v).trim();
+  if (!s) return NaN;
+  s = s.replace(/\s/g, "");
+
+  // SharePoint може повернути 1,700 як тисячі, а не як десяткове число.
+  if (s.includes(",") && s.includes(".")) {
+    s = s.replace(/,/g, "");
+  } else if (s.includes(",")) {
+    const parts = s.split(",");
+    if (parts.length === 2 && parts[1].length === 3) s = parts[0] + parts[1];
+    else s = s.replace(",", ".");
+  }
+
+  const n = Number(s);
+  return Number.isFinite(n) ? n : NaN;
+}
+function v39DecodeKey(k) {
+  return String(k || "")
+    .replace(/^OData_/, "")
+    .replace(/_x([0-9A-Fa-f]{4})_/g, (_, h) => String.fromCharCode(parseInt(h, 16)));
+}
+function v39NormKey(k) {
+  return v39DecodeKey(k).toLowerCase().replace(/[^a-zа-яіїєґ0-9]/gi, "");
+}
+function v39ByKey(row, aliases) {
+  const wanted = aliases.map(a => String(a).toLowerCase().replace(/[^a-zа-яіїєґ0-9]/gi, ""));
+  for (const a of aliases) {
+    if (row && row[a] !== undefined && row[a] !== null && row[a] !== "") return row[a];
+  }
+  for (const k of Object.keys(row || {})) {
+    const nk = v39NormKey(k);
+    if (wanted.some(w => nk === w || nk.includes(w) || w.includes(nk))) return row[k];
+  }
+  return undefined;
+}
+function v39Field(row, n) {
+  // Power Automate/SharePoint often returns imported List columns as field_1, field_2...
+  return row?.["field_" + n] ?? row?.["Field_" + n] ?? row?.["FIELD_" + n];
+}
+function v39TextBy(row, aliases, fieldNo, fallback = "") {
+  let v = v39ByKey(row, aliases);
+  if (v === undefined || v === null || v === "") v = v39Field(row, fieldNo);
+  const t = v39Text(v);
+  return t !== "" ? t : fallback;
+}
+function v39NumBy(row, aliases, fieldNo, fallback = 0) {
+  let v = v39ByKey(row, aliases);
+  let n = v39Num(v);
+  if (!Number.isFinite(n)) n = v39Num(v39Field(row, fieldNo));
+  return Number.isFinite(n) ? n : fallback;
+}
+function v39Photo(row) {
+  // normal named photo first
+  const named = findPhotoField(row);
+  if (named) return named;
+
+  // field_10/field_11 or any data:image string
+  for (const fn of [10,11,12,13]) {
+    const v = v39Field(row, fn);
+    if (typeof v === "string" && v.includes("data:image")) return v;
+  }
+  for (const k of Object.keys(row || {})) {
+    const v = row[k];
+    if (typeof v === "string" && v.includes("data:image")) return v;
+  }
+  return "";
+}
+function debugGetIncidentsV39() {
+  return fetch(GET_URL, {method:"POST"}).then(r=>r.json()).then(d=>{
+    console.log("GET keys:", Object.keys(d||{}));
+    console.log("incidents count:", (d.incidents||[]).length);
+    console.log("first raw incident:", (d.incidents||[])[0]);
+    console.log("first raw keys:", Object.keys((d.incidents||[])[0]||{}));
+    return d;
+  });
+}
+
+function v40NormText(s) {
+  return String(s || "").toLowerCase().replace(/\s+/g, " ").trim();
+}
+function v40AllTexts(row) {
+  return Object.keys(row || {}).map(k => v39Text(row[k])).filter(Boolean);
+}
+function v40AllNumbers(row) {
+  return Object.keys(row || {})
+    .map(k => v39Num(row[k]))
+    .filter(n => Number.isFinite(n) && n >= 0 && n < 100000000);
+}
+function v40FindFromDictionary(row, dict, getLabel) {
+  const rawTexts = v40AllTexts(row).map(v40NormText);
+  const items = (dict || []).map(x => ({src:x, label:v40NormText(getLabel(x))})).filter(x => x.label);
+  for (const item of items) {
+    if (rawTexts.some(t => t === item.label || t.includes(item.label) || item.label.includes(t))) return getLabel(item.src);
+  }
+  return "";
+}
+function v40FixIncidentFromRow(item, row) {
+  const texts = v40AllTexts(row);
+  const normTexts = texts.map(v40NormText);
+  const nums = v40AllNumbers(row);
+
+  if (!item.employee) {
+    item.employee = v40FindFromDictionary(row, employees, x => x) || "";
+  }
+
+  if (!item.product) {
+    const foundProduct = (products || []).find(p => {
+      const art = v40NormText(p.art);
+      const name = v40NormText(p.name);
+      return normTexts.some(t =>
+        (art && (t === art || t.includes(art))) ||
+        (name && (t.includes(name) || name.includes(t)))
+      );
+    });
+    if (foundProduct) item.product = `${foundProduct.art} - ${foundProduct.name}`;
+  }
+
+  if (!item.reason) {
+    item.reason = v40FindFromDictionary(row, reasons, r => r.name) || "";
+  }
+
+  if (!item.department) {
+    const possibleLocation = texts.find(t => {
+      const nt = v40NormText(t);
+      if (!nt || nt.length < 2) return false;
+      if (nt.startsWith("інц-")) return false;
+      if (item.employee && nt === v40NormText(item.employee)) return false;
+      if (item.product && v40NormText(item.product).includes(nt)) return false;
+      if (item.reason && nt === v40NormText(item.reason)) return false;
+      if (["на розгляді","затверджено","підтверджено","відхилено","розглянуто"].includes(nt)) return false;
+      if (/^\d{1,2}[./-]\d{1,2}[./-]\d{4}/.test(nt) || /^\d{4}-\d{2}-\d{2}/.test(nt)) return false;
+      return nt.includes("сгп") || nt.includes("соп") || nt.includes("прийм") || nt.includes("кам") || nt.includes("експед") || nt.includes("склад");
+    });
+    if (possibleLocation) item.department = possibleLocation;
+  }
+
+  const weight = Number(item.weight || 0);
+
+  if (!Number(item.loss || 0)) {
+    const candidates = nums.filter(n =>
+      n > 0 &&
+      n !== weight &&
+      n !== Number(item.percent || 0) &&
+      n !== Number(item.finalPercent || 0) &&
+      n > 100
+    );
+    if (candidates.length) item.loss = Math.max(...candidates);
+  }
+
+  if (!Number(item.score || 0)) {
+    const loss = Number(item.loss || 0);
+    const candidates = nums.filter(n => n > 0 && n !== weight && n !== Number(item.percent || 0) && n <= Math.max(loss, 1_000_000));
+    if (candidates.length) item.score = candidates.sort((a,b)=>b-a)[0];
+  }
+
+  if (!Number(item.percent || 0)) {
+    const knownPercents = [0,2,5,10,20,30,50,100];
+    const p = nums.find(n =>
+      knownPercents.includes(n) &&
+      n !== weight &&
+      n !== Number(item.loss || 0) &&
+      n !== Number(item.score || 0)
+    );
+    if (Number.isFinite(p)) {
+      item.percent = p;
+      if (!Number(item.finalPercent || 0)) item.finalPercent = p;
+    }
+  }
+
+  if (!item.date) {
+    const d = texts.find(t => /^\d{4}-\d{2}-\d{2}/.test(t) || /^\d{1,2}[./-]\d{1,2}[./-]\d{4}/.test(t));
+    if (d) item.date = d;
+  }
+
+  return item;
+}
+
+/* /v40 /v39 */
+
 function normalizeFromSharePoint(data) {
   employees = (data.employees || []).map(x => val(x, ["Title","LinkTitle","ПІБ","Pib"], "")).filter(Boolean);
 
@@ -755,28 +955,34 @@ function normalizeFromSharePoint(data) {
   }).filter(x => x.max > 0);
 
   incidents = (data.incidents || []).map(x => {
-    const title = smartText(x, ["Title","Заголовок","title"], ["title","заголовок"], "");
+    // IMPORTANT: field order fallback:
+    // field_1 Працівник, field_2 Продукт, field_3 Причина, field_4 ВагаКГ,
+    // field_5 СумаВтрат, field_6 Бал, field_7 РекомендованийВідсоток,
+    // field_8 Статус, field_9 ДатаІнциденту, field_10+ Фото.
+    const title = v39TextBy(x, ["Title","Заголовок","title"], 0, "");
+    const statusValue = v39TextBy(x, ["Статус","Status","status","Статус Value","Status Value"], 8, "На розгляді");
+    const percentValue = v39NumBy(x, ["РекомендованийВідсоток","РекомендованийВiдсоток","Рекомендований відсоток","Percent","percent"], 7, 0);
 
-    const statusValue = smartText(x, ["Статус","Status","status","Статус Value","Status Value"], ["статус","status"], "На розгляді");
-
-    return {
+    const mapped = {
       id: title,
-      date: smartText(x, ["ДатаІнциденту","ДатаИнциденту","Дата інциденту","date","Date"], ["датаінциденту","дата","date"], ""),
-      time: smartText(x, ["Час","time","Time"], ["час","time"], ""),
-      employee: smartText(x, ["Працівник","Працівник0","Сотрудник","employee","Employee"], ["працівник","праців","сотрудник","employee"], ""),
-      product: smartText(x, ["Продукт","Продукт0","product","Product"], ["продукт","product"], ""),
-      reason: smartText(x, ["Причина","Причина0","reason","Reason"], ["причина","reason"], ""),
-      weight: smartNumber(x, ["ВагаКГ","ВагаКг","Вага кг","Вага","weight","Weight"], ["вагакг","вага","weight"], 0),
-      loss: smartNumber(x, ["СумаВтрат","Сума втрат","СуммаПотерь","loss","Loss"], ["сумавтрат","втрат","loss"], 0),
-      score: smartNumber(x, ["Бал","score","Score"], ["бал","score"], 0),
-      percent: smartNumber(x, ["РекомендованийВідсоток","Рекомендований відсоток","percent","Percent"], ["рекомендованийвідсоток","відсоток","percent"], 0),
-      finalPercent: smartNumber(x, ["ФінальнийВідсоток","Фінальний відсоток","finalPercent","РекомендованийВідсоток"], ["фінальнийвідсоток","рекомендованийвідсоток","percent"], 0),
+      date: v39TextBy(x, ["ДатаІнциденту","ДатаИнциденту","Дата інциденту","Date","date"], 9, ""),
+      time: v39TextBy(x, ["Час","Time","time"], 0, ""),
+      employee: v39TextBy(x, ["Працівник","Працівник0","Працiвник","Сотрудник","Employee","employee"], 1, ""),
+      product: v39TextBy(x, ["Продукт","Продукт0","Product","product"], 2, ""),
+      reason: v39TextBy(x, ["Причина","Причина0","Reason","reason"], 3, ""),
+      weight: v39NumBy(x, ["ВагаКГ","ВагаКг","Вага кг","Вага","Weight","weight"], 4, 0),
+      loss: v39NumBy(x, ["СумаВтрат","Сума втрат","Loss","loss"], 5, 0),
+      score: v39NumBy(x, ["Бал","Score","score"], 6, 0),
+      percent: percentValue,
+      finalPercent: v39NumBy(x, ["ФінальнийВідсоток","Фінальний відсоток","FinalPercent","finalPercent"], 7, percentValue),
       status: statusValue || "На розгляді",
-      department: smartText(x, ["Локація","Локация","Підрозділ","department","Department"], ["локація","локация","підрозділ","department"], ""),
-      description: smartText(x, ["Опис","description","Description"], ["опис","description"], ""),
-      photo: findPhotoField(x),
+      department: v39TextBy(x, ["Локація","Локация","Підрозділ","Department","department","Location"], 0, ""),
+      description: v39TextBy(x, ["Опис","Description","description"], 0, ""),
+      managerComment: v39TextBy(x, ["Коментар керівника","КоментарКерівника","ManagerComment","managerComment","Comment","comment"], 0, ""),
+      photo: v39Photo(x),
       approved: ["Затверджено","Підтверджено","Відхилено","Розглянуто"].includes(statusValue)
     };
+    return v40FixIncidentFromRow(mapped, x);
   }).filter(x => x.id);
 
   incidents = mergeIncidentsWithLocalCache(incidents);
@@ -993,7 +1199,7 @@ try{
     alert("Інцидент збережено у SharePoint Lists");
     rememberIncidentLocally(item);
 
-    // Показуємо введені дані одразу, не чекаючи поки GET-flow поверне їх з SharePoint.
+    // Показуємо введені дані одразу і через 3 секунди перечитуємо SharePoint.
     incidents = mergeIncidentsWithLocalCache([item, ...incidents.filter(x => x.id !== item.id)]);
     renderAll();
 
@@ -1001,23 +1207,25 @@ try{
     photoPreview.innerHTML = "";
     photo.value = "";
     show("home");
+    setTimeout(() => loadFromSharePoint(true), 3000);
   } catch (err) {
     alert("Не вдалося записати в SharePoint: " + err.message);
   }
 }
 
 async function forceFullSyncFromSharePoint() {
-  localStorage.removeItem(LOCAL_INCIDENT_CACHE_KEY);
+  tempJustCreatedIncidents = [];
+  try { localStorage.removeItem(LOCAL_INCIDENT_CACHE_KEY); } catch(e) {}
   await loadFromSharePoint();
   renderAll();
-  alert("Синхронізацію з SharePoint виконано. Локальний кеш очищено.");
+  alert("Синхронізацію з SharePoint виконано.");
 }
 
 function clearLocalIncidentCacheOnly() {
-  localStorage.removeItem(LOCAL_INCIDENT_CACHE_KEY);
-  incidents = incidents.filter(i => i && i.id); 
+  tempJustCreatedIncidents = [];
+  try { localStorage.removeItem(LOCAL_INCIDENT_CACHE_KEY); } catch(e) {}
   renderAll();
-  alert("Локальний кеш очищено.");
+  alert("Тимчасову памʼять очищено.");
 }
 
 
@@ -1342,28 +1550,85 @@ function openManager(idx) {
     <label>Фінальний %</label>
     <input id="finalPercent" type="number" value="${i.finalPercent}">
     <label>Коментар керівника</label>
-    <textarea id="managerComment"></textarea>
+    <textarea id="managerComment">${escapeHtml(i.managerComment || "")}</textarea>
     <div class="actions">
       ${isReviewedStatus(i) ? `<button class="btn btn-green" onclick="show('home')">Назад до списку</button>` : `<button class="btn btn-blue" onclick="approve(${idx})">Підтвердити рішення</button><button class="btn btn-red" onclick="reject(${idx})">Не застосовувати</button>`}
     </div>
   `;
   show("manager");
 }
-function approve(idx) {
-  incidents[idx].finalPercent = Number(finalPercent.value || 0);
-  incidents[idx].status = "Затверджено";
-  incidents[idx].approved = true;
-  rememberIncidentLocally(incidents[idx]);
-  show("home");
-  renderAll();
+
+async function saveManagerDecisionToSharePoint(idx, statusText) {
+  const i = incidents[idx];
+  const finalValue = Number(document.getElementById("finalPercent")?.value || 0);
+  const commentValue = String(document.getElementById("managerComment")?.value || "").trim();
+
+  const payload = {
+    title: i.id,
+    employee: i.employee || "",
+    product: i.product || "",
+    reason: i.reason || "",
+    weight: Number(i.weight || 0),
+    loss: Number(i.loss || 0),
+    score: Number(i.score || 0),
+    percent: Number(i.percent || 0),
+    finalPercent: finalValue,
+    status: statusText,
+    managerComment: commentValue,
+    date: i.date || "",
+    department: i.department || "",
+    description: i.description || "",
+    photo: i.photo || ""
+  };
+
+  const response = await fetch(SAVE_URL, {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => "");
+    throw new Error("SAVE_DECISION повернув статус " + response.status + (errText ? ": " + errText.slice(0, 300) : ""));
+  }
+
+  i.finalPercent = finalValue;
+  i.status = statusText;
+  i.approved = true;
+  i.managerComment = commentValue;
+
+  // v42: protect UI from rollback while SharePoint/Flow cache catches up.
+  managerDecisionOverridesV42[i.id] = {
+    status: statusText,
+    finalPercent: finalValue,
+    managerComment: commentValue,
+    ts: Date.now()
+  };
 }
-function reject(idx) {
-  incidents[idx].finalPercent = 0;
-  incidents[idx].status = "Відхилено";
-  incidents[idx].approved = true;
-  rememberIncidentLocally(incidents[idx]);
-  show("home");
-  renderAll();
+
+async function approve(idx) {
+  try {
+    await saveManagerDecisionToSharePoint(idx, "Затверджено");
+    show("home");
+    renderAll();
+    setTimeout(() => loadFromSharePoint(true), 1500);
+    alert("Рішення збережено в Microsoft Lists");
+  } catch (err) {
+    alert("Не вдалося зберегти рішення в Lists: " + err.message);
+  }
+}
+async function reject(idx) {
+  try {
+    const fp = document.getElementById("finalPercent");
+    if (fp) fp.value = 0;
+    await saveManagerDecisionToSharePoint(idx, "Відхилено");
+    show("home");
+    renderAll();
+    setTimeout(() => loadFromSharePoint(true), 1500);
+    alert("Відхилення збережено в Microsoft Lists");
+  } catch (err) {
+    alert("Не вдалося зберегти відхилення в Lists: " + err.message);
+  }
 }
 function renderStats() {
   fillAnalyticsEmployees();
@@ -1425,3 +1690,5 @@ init();
 </script>
 </body>
 </html>
+
+
