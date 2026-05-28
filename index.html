@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0" />
-<title>MHP IncidentControl v42 NO STATUS ROLLBACK</title>
+<title>MHP IncidentControl v45_STATUS_LOCK_LOCATION_FIX</title>
 <style>
 :root{--navy:#071225;--blue:#0b7fe8;--bg:#f5f7fb;--card:#fff;--line:#dfe3ea;--text:#111827;--muted:#6b7280;--orange:#ff6a00;--green:#1f9d55;--red:#d93025}
 *{box-sizing:border-box}
@@ -332,8 +332,67 @@ function incidentCompletenessScoreV39(i) {
 const RESOLVED_STATUSES_V42 = ["Затверджено","Підтверджено","Відхилено","Розглянуто"];
 let managerDecisionOverridesV42 = {};
 
+const MANAGER_DECISION_LOCK_KEY_V45 = "MHP_INCIDENT_MANAGER_DECISION_LOCKS_V45";
+
+function loadManagerDecisionLocksV45() {
+  try {
+    const arr = JSON.parse(localStorage.getItem(MANAGER_DECISION_LOCK_KEY_V45) || "[]");
+    return Array.isArray(arr) ? arr : [];
+  } catch(e) {
+    return [];
+  }
+}
+
+function saveManagerDecisionLocksV45(arr) {
+  try {
+    // keep last 500 decisions
+    localStorage.setItem(MANAGER_DECISION_LOCK_KEY_V45, JSON.stringify((arr || []).slice(0, 500)));
+  } catch(e) {}
+}
+
+function rememberManagerDecisionLockV45(item) {
+  if (!item || !item.id) return;
+  const locks = loadManagerDecisionLocksV45().filter(x => x && x.id !== item.id);
+  locks.unshift({
+    id: item.id,
+    status: item.status || "",
+    finalPercent: Number(item.finalPercent || 0),
+    managerComment: item.managerComment || "",
+    ts: Date.now()
+  });
+  saveManagerDecisionLocksV45(locks);
+}
+
+function getManagerDecisionLockV45(id) {
+  const maxAge = 1000 * 60 * 60 * 24 * 30; // 30 days
+  const now = Date.now();
+  const locks = loadManagerDecisionLocksV45().filter(x => x && x.id && (now - Number(x.ts || 0) < maxAge));
+  saveManagerDecisionLocksV45(locks);
+  return locks.find(x => x.id === id);
+}
+
+function isRejectedStatusV45(s) {
+  return String(s || "").trim().toLowerCase().includes("відхил");
+}
+
+function displayStatusTextV45(status) {
+  const s = String(status || "").trim().toLowerCase();
+  if (s.includes("відхил")) return "Відхилено";
+  if (s.includes("затвер") || s.includes("підтверд") || s.includes("розглян")) return "Розглянуто";
+  return "На розгляді";
+}
+
+function displayStatusClassV45(status) {
+  const s = String(status || "").trim().toLowerCase();
+  if (s.includes("відхил")) return "bad";
+  if (s.includes("затвер") || s.includes("підтверд") || s.includes("розглян")) return "ok";
+  return "review";
+}
+
+
 function isResolvedStatusV42(s) {
-  return RESOLVED_STATUSES_V42.includes(String(s || "").trim());
+  const t = String(s || "").trim().toLowerCase();
+  return t.includes("затвер") || t.includes("підтверд") || t.includes("відхил") || t.includes("розглян");
 }
 
 function mergeOneIncidentV42(oldItem, newItem) {
@@ -343,7 +402,19 @@ function mergeOneIncidentV42(oldItem, newItem) {
   const oldResolved = isResolvedStatusV42(oldItem.status);
   const newResolved = isResolvedStatusV42(newItem.status);
 
-  // If one copy is already resolved, it must win over "На розгляді".
+  // Rejected must stay rejected if any duplicate row has it.
+  if (isRejectedStatusV45(oldItem.status) || isRejectedStatusV45(newItem.status)) {
+    const base = incidentCompletenessScoreV39(newItem) >= incidentCompletenessScoreV39(oldItem) ? newItem : oldItem;
+    const dec = isRejectedStatusV45(newItem.status) ? newItem : oldItem;
+    return {
+      ...base,
+      status: "Відхилено",
+      finalPercent: Number(dec.finalPercent || base.finalPercent || 0),
+      managerComment: dec.managerComment || base.managerComment || "",
+      approved: true
+    };
+  }
+
   const winner = newResolved && !oldResolved ? newItem :
                  oldResolved && !newResolved ? oldItem :
                  incidentCompletenessScoreV39(newItem) >= incidentCompletenessScoreV39(oldItem) ? newItem : oldItem;
@@ -353,7 +424,6 @@ function mergeOneIncidentV42(oldItem, newItem) {
   return {
     ...other,
     ...winner,
-    // Never lose resolved decision/comment/final percent.
     status: isResolvedStatusV42(winner.status) ? winner.status : (isResolvedStatusV42(other.status) ? other.status : winner.status),
     finalPercent: Number(winner.finalPercent || 0) || Number(other.finalPercent || 0) || 0,
     managerComment: winner.managerComment || other.managerComment || "",
@@ -362,19 +432,34 @@ function mergeOneIncidentV42(oldItem, newItem) {
 }
 
 function applyManagerOverrideV42(item) {
+  if (!item || !item.id) return item;
+
   const ov = managerDecisionOverridesV42[item.id];
-  if (!ov) return item;
-  if (Date.now() - ov.ts > 10 * 60 * 1000) {
-    delete managerDecisionOverridesV42[item.id];
-    return item;
+  if (ov && Date.now() - ov.ts <= 24 * 60 * 60 * 1000) {
+    return {
+      ...item,
+      status: ov.status,
+      finalPercent: Number(ov.finalPercent || 0),
+      managerComment: ov.managerComment || item.managerComment || "",
+      approved: true
+    };
   }
-  return {
-    ...item,
-    status: ov.status,
-    finalPercent: ov.finalPercent,
-    managerComment: ov.managerComment,
-    approved: true
-  };
+
+  const lock = getManagerDecisionLockV45(item.id);
+  // If SharePoint temporarily returns "На розгляді", but this browser knows it was already decided,
+  // keep the decision locked.
+  if (lock && isResolvedStatusV42(lock.status) && !isResolvedStatusV42(item.status)) {
+    return {
+      ...item,
+      status: lock.status,
+      finalPercent: Number(lock.finalPercent || item.finalPercent || 0),
+      managerComment: lock.managerComment || item.managerComment || "",
+      approved: true
+    };
+  }
+
+  if (ov) delete managerDecisionOverridesV42[item.id];
+  return item;
 }
 
 function mergeIncidentsWithLocalCache(serverIncidents, options = {}) {
@@ -847,6 +932,33 @@ function v40FindFromDictionary(row, dict, getLabel) {
   }
   return "";
 }
+
+function v45LocationFromRow(row, mapped) {
+  // Based on current Incidents list order:
+  // field_12 often stores Локація/department after Фото fields.
+  const direct = v39TextBy(row, [
+    "Локація","Локация","Локація0","Локация0",
+    "Підрозділ","Пiдроздiл","Department","department","Location","location",
+    "loc","Loc","Місце","Место"
+  ], 12, "");
+  if (direct && direct !== mapped?.employee && direct !== mapped?.product && direct !== mapped?.reason) return direct;
+
+  // Try field_11/13/14 too if column order differs.
+  for (const n of [11,13,14,15]) {
+    const t = v39Text(v39Field(row, n));
+    const nt = v40NormText(t);
+    if (!nt || nt.startsWith("інц-")) continue;
+    if (mapped?.employee && nt === v40NormText(mapped.employee)) continue;
+    if (mapped?.product && v40NormText(mapped.product).includes(nt)) continue;
+    if (mapped?.reason && nt === v40NormText(mapped.reason)) continue;
+    if (["на розгляді","затверджено","підтверджено","відхилено","розглянуто"].includes(nt)) continue;
+    if (/^\d{4}-\d{2}-\d{2}/.test(nt) || /^\d{1,2}[./-]\d{1,2}[./-]\d{4}/.test(nt)) continue;
+    if (/\d{2,}/.test(nt) && nt.length < 5) continue;
+    return t;
+  }
+  return mapped?.department || "";
+}
+
 function v40FixIncidentFromRow(item, row) {
   const texts = v40AllTexts(row);
   const normTexts = texts.map(v40NormText);
@@ -976,12 +1088,13 @@ function normalizeFromSharePoint(data) {
       percent: percentValue,
       finalPercent: v39NumBy(x, ["ФінальнийВідсоток","Фінальний відсоток","FinalPercent","finalPercent"], 7, percentValue),
       status: statusValue || "На розгляді",
-      department: v39TextBy(x, ["Локація","Локация","Підрозділ","Department","department","Location"], 0, ""),
+      department: v39TextBy(x, ["Локація","Локация","Локація0","Локация0","Підрозділ","Department","department","Location","loc","Місце","Место"], 12, ""),
       description: v39TextBy(x, ["Опис","Description","description"], 0, ""),
       managerComment: v39TextBy(x, ["Коментар керівника","КоментарКерівника","ManagerComment","managerComment","Comment","comment"], 0, ""),
       photo: v39Photo(x),
       approved: ["Затверджено","Підтверджено","Відхилено","Розглянуто"].includes(statusValue)
     };
+    mapped.department = v45LocationFromRow(x, mapped);
     return v40FixIncidentFromRow(mapped, x);
   }).filter(x => x.id);
 
@@ -1604,6 +1717,7 @@ async function saveManagerDecisionToSharePoint(idx, statusText) {
     managerComment: commentValue,
     ts: Date.now()
   };
+  rememberManagerDecisionLockV45(i);
 }
 
 async function approve(idx) {
@@ -1690,5 +1804,4 @@ init();
 </script>
 </body>
 </html>
-
 
