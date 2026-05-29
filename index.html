@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0" />
-<title>MHP IncidentControl v48_DESCRIPTION_FIX</title>
+<title>MHP IncidentControl v48_DESCRIPTION_MANAGER_ONLY</title>
 <style>
 :root{--navy:#071225;--blue:#0b7fe8;--bg:#f5f7fb;--card:#fff;--line:#dfe3ea;--text:#111827;--muted:#6b7280;--orange:#ff6a00;--green:#1f9d55;--red:#d93025}
 *{box-sizing:border-box}
@@ -1909,6 +1909,7 @@ function openManager(idx) {
     <div class="details">
       <div><span>Співробітник</span><b>${escapeHtml(i.employee)}</b></div>
       <div><span>Локація</span><b>${escapeHtml(i.location || i.department)}</b></div>
+      <div><span>Опис інциденту</span><b>${escapeHtml(i.description || "—")}</b></div>
       <div><span>Продукція</span><b>${escapeHtml(i.product)}</b></div>
       <div><span>Вага</span><b>${i.weight} кг</b></div>
       <div><span>Сума втрат</span><b>${i.loss} грн</b></div>
@@ -2065,5 +2066,6 @@ init();
 </script>
 </body>
 </html>
+
 
 
