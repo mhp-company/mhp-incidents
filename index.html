@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0" />
-<title>MHP IncidentControl v45_STATUS_LOCK_LOCATION_FIX</title>
+<title>MHP IncidentControl v48_DESCRIPTION_FIX</title>
 <style>
 :root{--navy:#071225;--blue:#0b7fe8;--bg:#f5f7fb;--card:#fff;--line:#dfe3ea;--text:#111827;--muted:#6b7280;--orange:#ff6a00;--green:#1f9d55;--red:#d93025}
 *{box-sizing:border-box}
@@ -406,8 +406,12 @@ function mergeOneIncidentV42(oldItem, newItem) {
   if (isRejectedStatusV45(oldItem.status) || isRejectedStatusV45(newItem.status)) {
     const base = incidentCompletenessScoreV39(newItem) >= incidentCompletenessScoreV39(oldItem) ? newItem : oldItem;
     const dec = isRejectedStatusV45(newItem.status) ? newItem : oldItem;
+    const loc = locationForPayloadV47(base) || locationForPayloadV47(dec);
     return {
       ...base,
+      location: loc || base.location || base.department || "",
+      department: loc || base.department || "",
+      description: pickDescriptionV48(base, dec),
       status: "Відхилено",
       finalPercent: Number(dec.finalPercent || base.finalPercent || 0),
       managerComment: dec.managerComment || base.managerComment || "",
@@ -421,9 +425,13 @@ function mergeOneIncidentV42(oldItem, newItem) {
 
   const other = winner === newItem ? oldItem : newItem;
 
+  const loc = locationForPayloadV47(winner) || locationForPayloadV47(other);
   return {
     ...other,
     ...winner,
+    location: loc || winner.location || other.location || "",
+    department: loc || winner.department || other.department || "",
+    description: pickDescriptionV48(winner, other),
     status: isResolvedStatusV42(winner.status) ? winner.status : (isResolvedStatusV42(other.status) ? other.status : winner.status),
     finalPercent: Number(winner.finalPercent || 0) || Number(other.finalPercent || 0) || 0,
     managerComment: winner.managerComment || other.managerComment || "",
@@ -438,6 +446,9 @@ function applyManagerOverrideV42(item) {
   if (ov && Date.now() - ov.ts <= 24 * 60 * 60 * 1000) {
     return {
       ...item,
+      location: locationForPayloadV47(item),
+      department: locationForPayloadV47(item) || item.department || "",
+      description: descriptionForPayloadV48(item) || item.description || "",
       status: ov.status,
       finalPercent: Number(ov.finalPercent || 0),
       managerComment: ov.managerComment || item.managerComment || "",
@@ -451,6 +462,9 @@ function applyManagerOverrideV42(item) {
   if (lock && isResolvedStatusV42(lock.status) && !isResolvedStatusV42(item.status)) {
     return {
       ...item,
+      location: locationForPayloadV47(item),
+      department: locationForPayloadV47(item) || item.department || "",
+      description: descriptionForPayloadV48(item) || item.description || "",
       status: lock.status,
       finalPercent: Number(lock.finalPercent || item.finalPercent || 0),
       managerComment: lock.managerComment || item.managerComment || "",
@@ -933,6 +947,238 @@ function v40FindFromDictionary(row, dict, getLabel) {
   return "";
 }
 
+
+/* v47 FINAL LOCATION FIX */
+const INCIDENT_LOCATION_CACHE_KEY_V47 = "MHP_INCIDENT_LOCATION_CACHE_V47";
+
+function loadLocationCacheV47() {
+  try {
+    const obj = JSON.parse(localStorage.getItem(INCIDENT_LOCATION_CACHE_KEY_V47) || "{}");
+    return obj && typeof obj === "object" ? obj : {};
+  } catch(e) {
+    return {};
+  }
+}
+
+function saveLocationCacheV47(obj) {
+  try {
+    localStorage.setItem(INCIDENT_LOCATION_CACHE_KEY_V47, JSON.stringify(obj || {}));
+  } catch(e) {}
+}
+
+function rememberLocationV47(id, location) {
+  const loc = String(location || "").trim();
+  if (!id || !loc) return;
+  const cache = loadLocationCacheV47();
+  cache[id] = loc;
+  saveLocationCacheV47(cache);
+}
+
+function getCachedLocationV47(id) {
+  const cache = loadLocationCacheV47();
+  return String(cache[id] || "").trim();
+}
+
+function textV47(v) {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "object") {
+    if (Array.isArray(v)) return v.map(textV47).filter(Boolean).join(", ");
+    return String(v.Value ?? v.value ?? v.Title ?? v.title ?? v.Label ?? v.label ?? "");
+  }
+  return String(v);
+}
+
+function keyV47(k) {
+  return String(k || "")
+    .replace(/^OData_/, "")
+    .replace(/_x([0-9A-Fa-f]{4})_/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .toLowerCase()
+    .replace(/[^a-zа-яіїєґ0-9]/gi, "");
+}
+
+function isBadLocationV47(value, mapped = {}) {
+  const s = String(value || "").trim();
+  const n = s.toLowerCase();
+  if (!s) return true;
+  if (s.startsWith("data:image")) return true;
+  if (n.startsWith("інц-")) return true;
+  if (n.includes("на розгляді") || n.includes("затверджено") || n.includes("підтверджено") || n.includes("відхилено") || n.includes("розглянуто")) return true;
+  if (n.includes("порушення") || n.includes("технічна") || n.includes("несправність") || n.includes("неуважність")) return true;
+  if (n.includes("філе") || n.includes("кур") || n.includes("охол") || n.includes("нефас")) return true;
+  if (/^\d+$/.test(n)) return true;
+  if (/^\d{4}-\d{2}-\d{2}/.test(n) || /^\d{1,2}[./-]\d{1,2}[./-]\d{4}/.test(n)) return true;
+  if (mapped.employee && n === String(mapped.employee).toLowerCase().trim()) return true;
+  if (mapped.product && String(mapped.product).toLowerCase().includes(n)) return true;
+  if (mapped.reason && n === String(mapped.reason).toLowerCase().trim()) return true;
+  return false;
+}
+
+function readLocationFromRowV47(row, mapped = {}) {
+  const aliases = ["локація","локация","локацiя","location","loc","місце","место","place"];
+
+  // Direct visible/internal column names first.
+  for (const k of Object.keys(row || {})) {
+    const nk = keyV47(k);
+    if (aliases.some(a => nk.includes(a))) {
+      const t = textV47(row[k]).trim();
+      if (!isBadLocationV47(t, mapped)) return t;
+    }
+  }
+
+  // Newly added columns often become field_N in GET response.
+  for (let n = 1; n <= 100; n++) {
+    const raw = row?.["field_" + n] ?? row?.["Field_" + n] ?? row?.["FIELD_" + n];
+    const t = textV47(raw).trim();
+    if (!isBadLocationV47(t, mapped)) {
+      const low = t.toLowerCase();
+      if (low.includes("согп") || low.includes("сгп") || low.includes("соп") ||
+          low.includes("склад") || low.includes("кам") || low.includes("цех") ||
+          low.includes("експед") || low.length <= 30) return t;
+    }
+  }
+
+  return "";
+}
+
+function setLocationFieldsV47(item, location) {
+  const loc = String(location || item?.location || item?.department || "").trim();
+  if (!item) return item;
+  if (loc) {
+    item.location = loc;
+    item.department = loc;
+    rememberLocationV47(item.id, loc);
+  }
+  return item;
+}
+
+function locationForPayloadV47(i) {
+  return String(i?.location || i?.department || getCachedLocationV47(i?.id) || "").trim();
+}
+
+function attachLocationIfPresentV47(payload, location) {
+  const loc = String(location || "").trim();
+  if (!loc) return payload; // do NOT send blank location: blank would clear the List column
+  payload.location = loc;
+  payload.Location = loc;
+  payload["Локація"] = loc;
+  payload.department = loc;
+  return payload;
+}
+
+function debugLocationV47() {
+  return fetch(GET_URL, {method:"POST"}).then(r=>r.json()).then(d=>{
+    const rows = d.incidents || [];
+    console.log("RAW first incident:", rows[0]);
+    console.log("RAW keys:", Object.keys(rows[0] || {}));
+    console.log("Detected location:", readLocationFromRowV47(rows[0] || {}, {}));
+    console.log("Location cache:", loadLocationCacheV47());
+    console.log("Normalized:", incidents.slice(0,3));
+    return d;
+  });
+}
+/* /v47 FINAL LOCATION FIX */
+
+/* v48 DESCRIPTION FIX */
+const INCIDENT_DESCRIPTION_CACHE_KEY_V48 = "MHP_INCIDENT_DESCRIPTION_CACHE_V48";
+
+function loadDescriptionCacheV48() {
+  try {
+    const obj = JSON.parse(localStorage.getItem(INCIDENT_DESCRIPTION_CACHE_KEY_V48) || "{}");
+    return obj && typeof obj === "object" ? obj : {};
+  } catch(e) { return {}; }
+}
+
+function saveDescriptionCacheV48(obj) {
+  try { localStorage.setItem(INCIDENT_DESCRIPTION_CACHE_KEY_V48, JSON.stringify(obj || {})); } catch(e) {}
+}
+
+function rememberDescriptionV48(id, description) {
+  const desc = String(description || "").trim();
+  if (!id || !desc) return;
+  const cache = loadDescriptionCacheV48();
+  cache[id] = desc;
+  saveDescriptionCacheV48(cache);
+}
+
+function getCachedDescriptionV48(id) {
+  return String(loadDescriptionCacheV48()[id] || "").trim();
+}
+
+function readDescriptionFromRowV48(row, mapped = {}) {
+  const aliases = [
+    "описінциденту","описинциденту","description","опис",
+    "описпроблеми","деталі","детали","incidentdescription"
+  ];
+
+  for (const k of Object.keys(row || {})) {
+    const nk = typeof keyV47 === "function"
+      ? keyV47(k)
+      : String(k || "").toLowerCase().replace(/[^a-zа-яіїєґ0-9]/gi, "");
+    if (aliases.some(a => nk.includes(a))) {
+      const t = (typeof textV47 === "function" ? textV47(row[k]) : String(row[k] || "")).trim();
+      if (isValidDescriptionV48(t, mapped)) return t;
+    }
+  }
+
+  for (let n = 1; n <= 100; n++) {
+    const raw = row?.["field_" + n] ?? row?.["Field_" + n] ?? row?.["FIELD_" + n];
+    const t = (typeof textV47 === "function" ? textV47(raw) : String(raw || "")).trim();
+    if (isValidDescriptionV48(t, mapped)) {
+      const low = t.toLowerCase();
+      if (t.length >= 8 && !low.includes("філе") && !low.includes("порушення 24") && !low.includes("технічна несправність")) return t;
+    }
+  }
+  return "";
+}
+
+function isValidDescriptionV48(value, mapped = {}) {
+  const s = String(value || "").trim();
+  const n = s.toLowerCase();
+  if (!s) return false;
+  if (s.startsWith("data:image")) return false;
+  if (n.startsWith("інц-")) return false;
+  if (n.includes("на розгляді") || n.includes("затверджено") || n.includes("підтверджено") || n.includes("відхилено") || n.includes("розглянуто")) return false;
+  if (/^\d+$/.test(n)) return false;
+  if (/^\d{4}-\d{2}-\d{2}/.test(n) || /^\d{1,2}[./-]\d{1,2}[./-]\d{4}/.test(n)) return false;
+  if (mapped.employee && n === String(mapped.employee).toLowerCase().trim()) return false;
+  if (mapped.product && n === String(mapped.product).toLowerCase().trim()) return false;
+  if (mapped.reason && n === String(mapped.reason).toLowerCase().trim()) return false;
+  if (mapped.location && n === String(mapped.location).toLowerCase().trim()) return false;
+  if (mapped.department && n === String(mapped.department).toLowerCase().trim()) return false;
+  return true;
+}
+
+function setDescriptionFieldsV48(item, description) {
+  const desc = String(description || item?.description || "").trim();
+  if (item && desc) {
+    item.description = desc;
+    rememberDescriptionV48(item.id, desc);
+  }
+  return item;
+}
+
+function descriptionForPayloadV48(i) {
+  return String(i?.description || getCachedDescriptionV48(i?.id) || "").trim();
+}
+
+function attachDescriptionIfPresentV48(payload, description) {
+  const desc = String(description || "").trim();
+  if (!desc) return payload;
+  payload.description = desc;
+  payload.Description = desc;
+  payload["Опис інциденту"] = desc;
+  return payload;
+}
+
+function pickDescriptionV48(a, b) {
+  return String(a?.description || "").trim() ||
+         String(b?.description || "").trim() ||
+         getCachedDescriptionV48(a?.id || b?.id) ||
+         "";
+}
+/* /v48 DESCRIPTION FIX */
+
+
 function v45LocationFromRow(row, mapped) {
   // Based on current Incidents list order:
   // field_12 often stores Локація/department after Фото fields.
@@ -1088,14 +1334,21 @@ function normalizeFromSharePoint(data) {
       percent: percentValue,
       finalPercent: v39NumBy(x, ["ФінальнийВідсоток","Фінальний відсоток","FinalPercent","finalPercent"], 7, percentValue),
       status: statusValue || "На розгляді",
-      department: v39TextBy(x, ["Локація","Локация","Локація0","Локация0","Підрозділ","Department","department","Location","loc","Місце","Место"], 12, ""),
+      department: "",
+      location: "",
       description: v39TextBy(x, ["Опис","Description","description"], 0, ""),
       managerComment: v39TextBy(x, ["Коментар керівника","КоментарКерівника","ManagerComment","managerComment","Comment","comment"], 0, ""),
       photo: v39Photo(x),
       approved: ["Затверджено","Підтверджено","Відхилено","Розглянуто"].includes(statusValue)
     };
-    mapped.department = v45LocationFromRow(x, mapped);
-    return v40FixIncidentFromRow(mapped, x);
+    const rowLoc = readLocationFromRowV47(x, mapped);
+    const cachedLoc = getCachedLocationV47(mapped.id);
+    setLocationFieldsV47(mapped, rowLoc || cachedLoc || v45LocationFromRow(x, mapped));
+    setDescriptionFieldsV48(mapped, readDescriptionFromRowV48(x, mapped) || getCachedDescriptionV48(mapped.id) || mapped.description);
+    const fixed = v40FixIncidentFromRow(mapped, x);
+    setLocationFieldsV47(fixed, fixed.location || fixed.department || rowLoc || cachedLoc);
+    setDescriptionFieldsV48(fixed, fixed.description || readDescriptionFromRowV48(x, fixed) || getCachedDescriptionV48(fixed.id));
+    return fixed;
   }).filter(x => x.id);
 
   incidents = mergeIncidentsWithLocalCache(incidents);
@@ -1279,6 +1532,7 @@ try{
     finalPercent: c.percent,
     status: "На розгляді",
     department: locSelect.value,
+    location: locSelect.value,
     description: description.value || "Опис не заповнено",
     photo: safePhoto,
     approved: false,
@@ -1288,7 +1542,7 @@ try{
     const response = await fetch(SAVE_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
+      body: JSON.stringify(attachDescriptionIfPresentV48(attachLocationIfPresentV47({
         title: item.id,
         employee: item.employee,
         product: item.product,
@@ -1303,13 +1557,15 @@ try{
         department: item.department,
         description: item.description,
         photo: safePhoto || ""
-      })
+      }, item.location || item.department), item.description))
     });
     if (!response.ok) {
       const errText = await response.text().catch(() => "");
       throw new Error("SAVE_INCIDENT повернув статус " + response.status + (errText ? ": " + errText.slice(0, 300) : ""));
     }
     alert("Інцидент збережено у SharePoint Lists");
+    rememberLocationV47(item.id, item.location || item.department);
+    rememberDescriptionV48(item.id, item.description);
     rememberIncidentLocally(item);
 
     // Показуємо введені дані одразу і через 3 секунди перечитуємо SharePoint.
@@ -1392,7 +1648,7 @@ function exportReportCSV() {
       i.date,
       i.time,
       i.employee,
-      i.department,
+      (i.location || i.department),
       i.product,
       i.reason,
       i.weight,
@@ -1633,7 +1889,7 @@ function renderList() {
       <div>
         <span class="badge ${displayStatusClass(i)}">${escapeHtml(displayStatusText(i))}</span>
         <h3>${escapeHtml(i.id)}</h3>
-        <div class="small">${escapeHtml(i.date)} ${escapeHtml(i.time)} · ${escapeHtml(i.department)}</div>
+        <div class="small">${escapeHtml(i.date)} ${escapeHtml(i.time)} · ${escapeHtml(i.location || i.department)}</div>
         <p>${escapeHtml(i.reason || i.product || "Дані інциденту")}</p>
         <b>Вага: ${i.weight} кг · Сума: ${i.loss} грн</b><br>
         <b>Рекомендовано: ${i.percent}%</b>
@@ -1652,7 +1908,7 @@ function openManager(idx) {
     <p><b>${escapeHtml(i.id)}</b></p>
     <div class="details">
       <div><span>Співробітник</span><b>${escapeHtml(i.employee)}</b></div>
-      <div><span>Локація</span><b>${escapeHtml(i.department)}</b></div>
+      <div><span>Локація</span><b>${escapeHtml(i.location || i.department)}</b></div>
       <div><span>Продукція</span><b>${escapeHtml(i.product)}</b></div>
       <div><span>Вага</span><b>${i.weight} кг</b></div>
       <div><span>Сума втрат</span><b>${i.loss} грн</b></div>
@@ -1694,6 +1950,9 @@ async function saveManagerDecisionToSharePoint(idx, statusText) {
     photo: i.photo || ""
   };
 
+  attachLocationIfPresentV47(payload, locationForPayloadV47(i));
+  attachDescriptionIfPresentV48(payload, descriptionForPayloadV48(i));
+
   const response = await fetch(SAVE_URL, {
     method: "POST",
     headers: {"Content-Type": "application/json"},
@@ -1709,6 +1968,8 @@ async function saveManagerDecisionToSharePoint(idx, statusText) {
   i.status = statusText;
   i.approved = true;
   i.managerComment = commentValue;
+  rememberLocationV47(i.id, locationForPayloadV47(i));
+  rememberDescriptionV48(i.id, descriptionForPayloadV48(i));
 
   // v42: protect UI from rollback while SharePoint/Flow cache catches up.
   managerDecisionOverridesV42[i.id] = {
@@ -1804,4 +2065,5 @@ init();
 </script>
 </body>
 </html>
+
 
