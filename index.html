@@ -4,7 +4,7 @@
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
 <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0" />
-<title>MHP IncidentControl v48_DESCRIPTION_MANAGER_ONLY</title>
+<title>MHP IncidentControl v49_GLOBAL_STATUS_FROM_LIST</title>
 <style>
 :root{--navy:#071225;--blue:#0b7fe8;--bg:#f5f7fb;--card:#fff;--line:#dfe3ea;--text:#111827;--muted:#6b7280;--orange:#ff6a00;--green:#1f9d55;--red:#d93025}
 *{box-sizing:border-box}
@@ -376,23 +376,16 @@ function isRejectedStatusV45(s) {
 }
 
 function displayStatusTextV45(status) {
-  const s = String(status || "").trim().toLowerCase();
-  if (s.includes("відхил")) return "Відхилено";
-  if (s.includes("затвер") || s.includes("підтверд") || s.includes("розглян")) return "Розглянуто";
-  return "На розгляді";
+  return displayStatusTextV49(status);
 }
 
 function displayStatusClassV45(status) {
-  const s = String(status || "").trim().toLowerCase();
-  if (s.includes("відхил")) return "bad";
-  if (s.includes("затвер") || s.includes("підтверд") || s.includes("розглян")) return "ok";
-  return "review";
+  return displayStatusClassV49(status);
 }
 
 
 function isResolvedStatusV42(s) {
-  const t = String(s || "").trim().toLowerCase();
-  return t.includes("затвер") || t.includes("підтверд") || t.includes("відхил") || t.includes("розглян");
+  return isReviewedStatusFromListV49(s);
 }
 
 function mergeOneIncidentV42(oldItem, newItem) {
@@ -432,7 +425,7 @@ function mergeOneIncidentV42(oldItem, newItem) {
     location: loc || winner.location || other.location || "",
     department: loc || winner.department || other.department || "",
     description: pickDescriptionV48(winner, other),
-    status: isResolvedStatusV42(winner.status) ? winner.status : (isResolvedStatusV42(other.status) ? other.status : winner.status),
+    status: statusRankV49(winner.status) >= statusRankV49(other.status) ? canonicalStatusV49(winner.status) || winner.status : canonicalStatusV49(other.status) || other.status,
     finalPercent: Number(winner.finalPercent || 0) || Number(other.finalPercent || 0) || 0,
     managerComment: winner.managerComment || other.managerComment || "",
     approved: isResolvedStatusV42(winner.status) || isResolvedStatusV42(other.status) || Boolean(winner.approved || other.approved)
@@ -1288,6 +1281,94 @@ function v40FixIncidentFromRow(item, row) {
 
 /* /v40 /v39 */
 
+
+/* v49 GLOBAL STATUS FROM LIST FIX */
+function statusTextV49(v) {
+  if (v === null || v === undefined) return "";
+  if (typeof v === "object") {
+    if (Array.isArray(v)) return v.map(statusTextV49).filter(Boolean).join(", ");
+    return String(v.Value ?? v.value ?? v.Title ?? v.title ?? v.Label ?? v.label ?? "");
+  }
+  return String(v);
+}
+
+function statusKeyV49(k) {
+  return String(k || "")
+    .replace(/^OData_/, "")
+    .replace(/_x([0-9A-Fa-f]{4})_/g, (_, h) => String.fromCharCode(parseInt(h, 16)))
+    .toLowerCase()
+    .replace(/[^a-zа-яіїєґ0-9]/gi, "");
+}
+
+function statusRankV49(s) {
+  const t = String(s || "").trim().toLowerCase();
+  if (t.includes("відхил")) return 4;
+  if (t.includes("затвер")) return 3;
+  if (t.includes("підтверд")) return 3;
+  if (t.includes("розглянуто")) return 2;
+  if (t.includes("на розгляді")) return 1;
+  return 0;
+}
+
+function canonicalStatusV49(s) {
+  const t = String(s || "").trim().toLowerCase();
+  if (t.includes("відхил")) return "Відхилено";
+  if (t.includes("затвер")) return "Затверджено";
+  if (t.includes("підтверд")) return "Підтверджено";
+  if (t.includes("розглянуто")) return "Розглянуто";
+  if (t.includes("на розгляді")) return "На розгляді";
+  return "";
+}
+
+function readStatusFromSharePointV49(row, fallback = "На розгляді") {
+  let best = "";
+  let bestRank = 0;
+
+  // 1) First priority: columns whose key/name is status/статус.
+  for (const k of Object.keys(row || {})) {
+    const nk = statusKeyV49(k);
+    if (nk.includes("статус") || nk.includes("status")) {
+      const txt = statusTextV49(row[k]);
+      const r = statusRankV49(txt);
+      if (r > bestRank) {
+        best = canonicalStatusV49(txt);
+        bestRank = r;
+      }
+    }
+  }
+
+  // 2) Second priority: scan all values. This catches "Статус Value" and field_N from Flow.
+  for (const k of Object.keys(row || {})) {
+    const txt = statusTextV49(row[k]);
+    const r = statusRankV49(txt);
+    if (r > bestRank) {
+      best = canonicalStatusV49(txt);
+      bestRank = r;
+    }
+  }
+
+  return best || fallback || "На розгляді";
+}
+
+function isReviewedStatusFromListV49(status) {
+  return statusRankV49(status) >= 2;
+}
+
+function displayStatusTextV49(status) {
+  const s = canonicalStatusV49(status);
+  if (s === "Відхилено") return "Відхилено";
+  if (s === "Затверджено" || s === "Підтверджено" || s === "Розглянуто") return "Розглянуто";
+  return "На розгляді";
+}
+
+function displayStatusClassV49(status) {
+  const s = canonicalStatusV49(status);
+  if (s === "Відхилено") return "bad";
+  if (s === "Затверджено" || s === "Підтверджено" || s === "Розглянуто") return "ok";
+  return "review";
+}
+/* /v49 GLOBAL STATUS FROM LIST FIX */
+
 function normalizeFromSharePoint(data) {
   employees = (data.employees || []).map(x => val(x, ["Title","LinkTitle","ПІБ","Pib"], "")).filter(Boolean);
 
@@ -1318,7 +1399,7 @@ function normalizeFromSharePoint(data) {
     // field_5 СумаВтрат, field_6 Бал, field_7 РекомендованийВідсоток,
     // field_8 Статус, field_9 ДатаІнциденту, field_10+ Фото.
     const title = v39TextBy(x, ["Title","Заголовок","title"], 0, "");
-    const statusValue = v39TextBy(x, ["Статус","Status","status","Статус Value","Status Value"], 8, "На розгляді");
+    const statusValue = readStatusFromSharePointV49(x, v39TextBy(x, ["Статус","Status","status","Статус Value","Status Value"], 8, "На розгляді"));
     const percentValue = v39NumBy(x, ["РекомендованийВідсоток","РекомендованийВiдсоток","Рекомендований відсоток","Percent","percent"], 7, 0);
 
     const mapped = {
@@ -1339,7 +1420,7 @@ function normalizeFromSharePoint(data) {
       description: v39TextBy(x, ["Опис","Description","description"], 0, ""),
       managerComment: v39TextBy(x, ["Коментар керівника","КоментарКерівника","ManagerComment","managerComment","Comment","comment"], 0, ""),
       photo: v39Photo(x),
-      approved: ["Затверджено","Підтверджено","Відхилено","Розглянуто"].includes(statusValue)
+      approved: isReviewedStatusFromListV49(statusValue)
     };
     const rowLoc = readLocationFromRowV47(x, mapped);
     const cachedLoc = getCachedLocationV47(mapped.id);
@@ -1862,8 +1943,7 @@ function closePhotoModal(){
 
 
 function isReviewedStatus(i) {
-  const s = String(i?.status || "").trim().toLowerCase();
-  return i?.approved === true || s === "затверджено" || s === "підтверджено" || s === "відхилено";
+  return isReviewedStatusFromListV49(i?.status);
 }
 function displayStatusText(i) {
   return isReviewedStatus(i) ? "Розглянуто" : (i.status || "На розгляді");
@@ -2066,6 +2146,7 @@ init();
 </script>
 </body>
 </html>
+
 
 
 
